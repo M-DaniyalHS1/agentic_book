@@ -158,5 +158,5 @@ gemini_client = None
 async def init_gemini_client():
     """Initialize the Gemini client."""
     global gemini_client
-    if settings.GEMINI_API_KEY:  # Only initialize if API key is available
+    if settings.google_api_key:  # Only initialize if API key is available
         gemini_client = GeminiClient()

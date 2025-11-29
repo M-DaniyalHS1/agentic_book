@@ -1,11 +1,16 @@
 import asyncio
+import sys
+import os
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
 
+# Add the parent directory to the path so we can import the models
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
 # Import your database models
-from backend.src.models.sqlalchemy_models import Base  # Adjust import path as needed
+from backend.src.models.sqlalchemy_models import Base
 
 # this is the Alembic Config object
 config = context.config
@@ -36,7 +41,12 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    import sys
+    import os
+    # Add the parent directory to the path so we can import the config
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    from backend.src.config import settings
+    url = settings.database_url
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -59,9 +69,13 @@ async def run_async_migrations():
     """In this scenario we need to create an Engine
     and associate a connection with the context.
     """
-    from backend.src.config import settings  # Adjust import path as needed
+    import sys
+    import os
+    # Add the parent directory to the path so we can import the config
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    from backend.src.config import settings
     connectable = engine_from_config(
-        {"sqlalchemy.url": settings.DATABASE_URL},
+        {"sqlalchemy.url": settings.database_url},
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
@@ -77,6 +91,7 @@ def run_migrations_online() -> None:
     asyncio.run(run_async_migrations())
 
 
+# Set the context to use offline mode when generating migrations
 if context.is_offline_mode():
     run_migrations_offline()
 else:
