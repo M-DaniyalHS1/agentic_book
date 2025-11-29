@@ -1,273 +1,406 @@
 """Document processing utilities for the AI-Enhanced Interactive Book Agent.
 
-This module provides utilities for processing various document formats
-(PDF, DOCX, EPUB, TXT) and extracting text content for the RAG system.
+This module provides utilities for processing various document formats (PDF, DOCX, EPUB, etc.)
+for use in the RAG system, including text extraction, cleaning, and preparation for chunking.
 """
 import asyncio
-import pdfplumber
-import docx
-from ebooklib import ebooklib
-from ebooklib.epub import EpubReader
-import html2text
-from typing import List, Tuple, Optional
+import os
+import tempfile
+from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
+import PyPDF2
+import pdfplumber
+from docx import Document as DocxDocument
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+import chardet
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 class DocumentProcessor:
-    """Utility class for processing different document formats."""
-    
-    @staticmethod
-    async def extract_text_from_pdf(file_path: str) -> str:
-        """Extract text content from a PDF file.
-        
+    """Main class for processing documents of various formats."""
+
+    def __init__(self):
+        """Initialize the document processor."""
+        self.supported_formats = ['.pdf', '.docx', '.epub', '.txt']
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            length_function=len,
+        )
+
+    async def process_document(self, file_path: str) -> Dict[str, Any]:
+        """Process a document and extract its content.
+
+        Args:
+            file_path: Path to the document file
+
+        Returns:
+            Dictionary containing extracted content and metadata
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Document file not found: {file_path}")
+
+        file_extension = file_path.suffix.lower()
+        if file_extension not in self.supported_formats:
+            raise ValueError(f"Unsupported file format: {file_extension}. Supported: {self.supported_formats}")
+
+        # Extract content based on file type
+        if file_extension == '.pdf':
+            content, metadata = await self._extract_pdf_content(file_path)
+        elif file_extension == '.docx':
+            content, metadata = await self._extract_docx_content(file_path)
+        elif file_extension == '.epub':
+            content, metadata = await self._extract_epub_content(file_path)
+        elif file_extension == '.txt':
+            content, metadata = await self._extract_txt_content(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_extension}")
+
+        # Clean and preprocess the content
+        cleaned_content = self._clean_text(content)
+
+        # Extract additional metadata
+        file_stats = file_path.stat()
+        additional_metadata = {
+            "file_name": file_path.name,
+            "file_path": str(file_path),
+            "file_size": file_stats.st_size,
+            "file_extension": file_extension,
+            "created_at": file_stats.st_ctime,
+            "modified_at": file_stats.st_mtime
+        }
+
+        # Combine metadata
+        full_metadata = {**metadata, **additional_metadata}
+
+        return {
+            "content": cleaned_content,
+            "metadata": full_metadata,
+            "chunks": await self._chunk_content(cleaned_content, full_metadata)
+        }
+
+    async def _extract_pdf_content(self, file_path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract content from a PDF file.
+
         Args:
             file_path: Path to the PDF file
-            
+
         Returns:
-            Extracted text content
+            Tuple of (content, metadata)
         """
+        content = ""
+        metadata = {}
+
         try:
-            text_content = ""
-            
+            # Using pdfplumber for better text extraction
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
                     page_text = page.extract_text()
                     if page_text:
-                        text_content += page_text + "\n"
-            
-            return text_content
+                        content += page_text + "\n"
+
+            # Extract metadata using PyPDF2
+            with open(file_path, 'rb') as pdf_file:
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                pdf_metadata = pdf_reader.metadata
+
+                if pdf_metadata:
+                    metadata = {
+                        "title": pdf_metadata.get('/Title', ''),
+                        "author": pdf_metadata.get('/Author', ''),
+                        "subject": pdf_metadata.get('/Subject', ''),
+                        "creator": pdf_metadata.get('/Creator', ''),
+                        "producer": pdf_metadata.get('/Producer', ''),
+                        "creation_date": str(pdf_metadata.get('/CreationDate', '')),
+                        "modification_date": str(pdf_metadata.get('/ModDate', '')),
+                        "pages": len(pdf_reader.pages)
+                    }
+
         except Exception as e:
-            raise Exception(f"Error extracting text from PDF: {str(e)}")
-    
-    @staticmethod
-    async def extract_text_from_docx(file_path: str) -> str:
-        """Extract text content from a DOCX file.
-        
+            print(f"Error processing PDF: {str(e)}")
+            # Fallback using PyPDF2 only
+            with open(file_path, 'rb') as pdf_file:
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                for page in pdf_reader.pages:
+                    content += page.extract_text() + "\n"
+
+        return content, metadata
+
+    async def _extract_docx_content(self, file_path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract content from a DOCX file.
+
         Args:
             file_path: Path to the DOCX file
-            
+
         Returns:
-            Extracted text content
+            Tuple of (content, metadata)
         """
+        content = ""
+        metadata = {}
+
         try:
-            doc = docx.Document(file_path)
-            text_content = []
-            
+            doc = DocxDocument(file_path)
+
+            # Extract content
             for paragraph in doc.paragraphs:
-                text_content.append(paragraph.text)
-            
-            # Also extract from tables if present
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        text_content.append(cell.text)
-            
-            return "\n".join(text_content)
+                content += paragraph.text + "\n"
+
+            # Extract metadata
+            core_props = doc.core_properties
+            metadata = {
+                "title": core_props.title or "",
+                "author": core_props.author or "",
+                "subject": core_props.subject or "",
+                "comments": core_props.comments or "",
+                "keywords": core_props.keywords or "",
+                "last_modified_by": core_props.last_modified_by or "",
+                "created": str(core_props.created) if core_props.created else "",
+                "modified": str(core_props.modified) if core_props.modified else "",
+            }
+
         except Exception as e:
-            raise Exception(f"Error extracting text from DOCX: {str(e)}")
-    
-    @staticmethod
-    async def extract_text_from_epub(file_path: str) -> str:
-        """Extract text content from an EPUB file.
-        
+            print(f"Error processing DOCX: {str(e)}")
+            raise e
+
+        return content, metadata
+
+    async def _extract_epub_content(self, file_path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract content from an EPUB file.
+
         Args:
             file_path: Path to the EPUB file
-            
+
         Returns:
-            Extracted text content
+            Tuple of (content, metadata)
         """
+        content = ""
+        metadata = {}
+
         try:
-            h = html2text.HTML2Text()
-            h.ignore_links = True
-            h.ignore_images = True
-            
-            reader = EpubReader(file_path)
-            book = reader.load_book()
-            
-            text_content = []
-            
+            book = epub.read_epub(file_path)
+
+            # Extract metadata
+            metadata = {
+                "title": list(book.get_metadata('DC', 'title'))[0][0] if book.get_metadata('DC', 'title') else "",
+                "creator": list(book.get_metadata('DC', 'creator'))[0][0] if book.get_metadata('DC', 'creator') else "",
+                "subject": list(book.get_metadata('DC', 'subject'))[0][0] if book.get_metadata('DC', 'subject') else "",
+                "description": list(book.get_metadata('DC', 'description'))[0][0] if book.get_metadata('DC', 'description') else "",
+                "publisher": list(book.get_metadata('DC', 'publisher'))[0][0] if book.get_metadata('DC', 'publisher') else "",
+                "contributor": list(book.get_metadata('DC', 'contributor'))[0][0] if book.get_metadata('DC', 'contributor') else "",
+                "date": list(book.get_metadata('DC', 'date'))[0][0] if book.get_metadata('DC', 'date') else "",
+                "type": list(book.get_metadata('DC', 'type'))[0][0] if book.get_metadata('DC', 'type') else "",
+                "format": list(book.get_metadata('DC', 'format'))[0][0] if book.get_metadata('DC', 'format') else "",
+                "identifier": list(book.get_metadata('DC', 'identifier'))[0][0] if book.get_metadata('DC', 'identifier') else "",
+                "source": list(book.get_metadata('DC', 'source'))[0][0] if book.get_metadata('DC', 'source') else "",
+                "language": list(book.get_metadata('DC', 'language'))[0][0] if book.get_metadata('DC', 'language') else "",
+                "relation": list(book.get_metadata('DC', 'relation'))[0][0] if book.get_metadata('DC', 'relation') else "",
+                "coverage": list(book.get_metadata('DC', 'coverage'))[0][0] if book.get_metadata('DC', 'coverage') else "",
+                "rights": list(book.get_metadata('DC', 'rights'))[0][0] if book.get_metadata('DC', 'rights') else "",
+            }
+
+            # Extract content from chapters
             for item in book.get_items():
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    # Convert HTML content to plain text
-                    content = h.handle(item.get_content().decode('utf-8'))
-                    text_content.append(content)
-            
-            return "\n".join(text_content)
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    content += soup.get_text() + "\n"
+
         except Exception as e:
-            raise Exception(f"Error extracting text from EPUB: {str(e)}")
-    
-    @staticmethod
-    async def extract_text_from_txt(file_path: str) -> str:
-        """Extract text content from a TXT file.
-        
+            print(f"Error processing EPUB: {str(e)}")
+            raise e
+
+        return content, metadata
+
+    async def _extract_txt_content(self, file_path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract content from a TXT file.
+
         Args:
             file_path: Path to the TXT file
-            
+
         Returns:
-            Extracted text content
+            Tuple of (content, metadata)
         """
+        content = ""
+        metadata = {"encoding": "unknown"}
+
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read()
-        except Exception as e:
-            raise Exception(f"Error extracting text from TXT: {str(e)}")
-    
-    @staticmethod
-    async def get_document_metadata(file_path: str) -> dict:
-        """Extract metadata from a document file.
-        
-        Args:
-            file_path: Path to the document file
+            # Try common encodings first
+            encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
             
-        Returns:
-            Dictionary containing document metadata
-        """
-        path = Path(file_path)
-        metadata = {
-            'file_name': path.name,
-            'file_size': path.stat().st_size,
-            'file_type': path.suffix.lower(),
-            'last_modified': path.stat().st_mtime
-        }
-        
-        # Add format-specific metadata
-        if path.suffix.lower() == '.pdf':
-            try:
-                with pdfplumber.open(file_path) as pdf:
-                    metadata['page_count'] = len(pdf.pages)
-                    # Extract PDF-specific metadata if available
-                    if pdf.metadata:
-                        metadata.update({
-                            'title': pdf.metadata.get('Title', ''),
-                            'author': pdf.metadata.get('Author', ''),
-                            'subject': pdf.metadata.get('Subject', ''),
-                            'creator': pdf.metadata.get('Creator', ''),
-                            'producer': pdf.metadata.get('Producer', ''),
-                            'creation_date': pdf.metadata.get('CreationDate', ''),
-                            'modification_date': pdf.metadata.get('ModDate', ''),
-                        })
-            except:
-                pass  # If we can't get PDF metadata, continue with basic metadata
-        
-        elif path.suffix.lower() == '.docx':
-            try:
-                doc = docx.Document(file_path)
-                core_props = doc.core_properties
-                metadata.update({
-                    'title': core_props.title or '',
-                    'author': core_props.author or '',
-                    'subject': core_props.subject or '',
-                    'creator': core_props.creator or '',
-                    'description': core_props.description or '',
-                    'keywords': core_props.keywords or '',
-                    'last_modified_by': core_props.last_modified_by or '',
-                    'revision': core_props.revision,
-                    'created': core_props.created,
-                    'modified': core_props.modified,
-                })
-            except:
-                pass  # If we can't get DOCX metadata, continue with basic metadata
-        
-        return metadata
-    
-    @staticmethod
-    async def process_document(file_path: str, chunk_size: int = 1000, overlap: int = 100) -> List[Tuple[str, dict]]:
-        """Process a document and split it into chunks for the RAG system.
-        
-        Args:
-            file_path: Path to the document file
-            chunk_size: Size of each text chunk
-            overlap: Overlap between chunks to maintain context
-            
-        Returns:
-            List of tuples containing (chunk_text, chunk_metadata)
-        """
-        # Determine file type and extract text
-        file_ext = Path(file_path).suffix.lower()
-        
-        if file_ext == '.pdf':
-            text_content = await DocumentProcessor.extract_text_from_pdf(file_path)
-        elif file_ext == '.docx':
-            text_content = await DocumentProcessor.extract_text_from_docx(file_path)
-        elif file_ext == '.epub':
-            text_content = await DocumentProcessor.extract_text_from_epub(file_path)
-        elif file_ext == '.txt':
-            text_content = await DocumentProcessor.extract_text_from_txt(file_path)
-        else:
-            raise ValueError(f"Unsupported file type: {file_ext}")
-        
-        # Split text into chunks
-        chunks = DocumentProcessor._split_text(text_content, chunk_size, overlap)
-        
-        # Get document metadata
-        doc_metadata = await DocumentProcessor.get_document_metadata(file_path)
-        
-        # Create chunks with metadata
-        chunked_data = []
-        for i, chunk in enumerate(chunks):
-            chunk_metadata = doc_metadata.copy()
-            chunk_metadata.update({
-                'chunk_id': f"{doc_metadata['file_name']}_chunk_{i}",
-                'chunk_index': i,
-                'total_chunks': len(chunks),
-                'start_pos': i * (chunk_size - overlap),
-                'end_pos': min((i + 1) * (chunk_size - overlap) + chunk_size, len(text_content))
-            })
-            chunked_data.append((chunk, chunk_metadata))
-        
-        return chunked_data
-    
-    @staticmethod
-    def _split_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-        """Split text into chunks of specified size with overlap.
-        
-        Args:
-            text: Text to be split
-            chunk_size: Size of each text chunk
-            overlap: Overlap between chunks
-            
-        Returns:
-            List of text chunks
-        """
-        if len(text) <= chunk_size:
-            return [text]
-        
-        chunks = []
-        start = 0
-        
-        while start < len(text):
-            end = start + chunk_size
-            
-            # If this is not the last chunk, try to break at a sentence boundary
-            if end < len(text):
-                # Look for a sentence boundary near the end
-                search_start = end - overlap
-                sentence_end = -1
-                
-                for sep in ['.\n', '. ', '! ', '? ', '\n\n', '\n']:
-                    last_sep = text.rfind(sep, search_start, end)
-                    if last_sep != -1:
-                        sentence_end = last_sep + len(sep)
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        content = file.read()
+                        metadata["encoding"] = encoding
                         break
-                
-                if sentence_end != -1 and sentence_end > search_start:
-                    end = sentence_end
-                else:
-                    # If no good break point found, just take the chunk
-                    end = min(end, len(text))
-            
-            chunk = text[start:end].strip()
-            if chunk:  # Only add non-empty chunks
-                chunks.append(chunk)
-            
-            start = end  # Move start to the end of current chunk
-            
-            # If overlap is required, adjust start position
-            if overlap > 0 and start > overlap:
-                start = start - overlap
-        
-        return chunks
+                except UnicodeDecodeError:
+                    continue
+            else:
+                # If common encodings fail, try to detect encoding
+                with open(file_path, 'rb') as file:
+                    raw_data = file.read()
+                    encoding_result = chardet.detect(raw_data)
+                    detected_encoding = encoding_result['encoding']
+                    
+                    if detected_encoding:
+                        content = raw_data.decode(detected_encoding)
+                        metadata["encoding"] = detected_encoding
+                    else:
+                        raise UnicodeDecodeError("Could not determine file encoding")
+
+        except Exception as e:
+            print(f"Error processing TXT: {str(e)}")
+            raise e
+
+        return content, metadata
+
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize extracted text.
+
+        Args:
+            text: Raw text to clean
+
+        Returns:
+            Cleaned text
+        """
+        if not text:
+            return ""
+
+        # Normalize whitespace
+        text = ' '.join(text.split())
+
+        # Remove extra newlines but preserve paragraph structure
+        import re
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+
+        # Remove control characters except newlines and tabs
+        text = ''.join(char for char in text if ord(char) < 32 and char not in '\n\t' or ord(char) >= 32)
+
+        return text.strip()
+
+    async def _chunk_content(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Split content into chunks for RAG processing.
+
+        Args:
+            content: Content to chunk
+            metadata: Metadata associated with the content
+
+        Returns:
+            List of chunk dictionaries
+        """
+        chunks = self.text_splitter.split_text(content)
+        chunked_data = []
+
+        for idx, chunk in enumerate(chunks):
+            chunk_data = {
+                "chunk_id": f"{metadata.get('file_name', 'unknown')}_{idx}",
+                "content": chunk,
+                "metadata": {
+                    **metadata,
+                    "chunk_index": idx,
+                    "total_chunks": len(chunks),
+                    "chunk_size": len(chunk),
+                }
+            }
+            chunked_data.append(chunk_data)
+
+        return chunked_data
+
+    async def get_document_info(self, file_path: str) -> Dict[str, Any]:
+        """Get basic information about a document without processing its full content.
+
+        Args:
+            file_path: Path to the document file
+
+        Returns:
+            Dictionary with document information
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Document file not found: {file_path}")
+
+        file_extension = file_path.suffix.lower()
+        file_stats = file_path.stat()
+
+        info = {
+            "file_name": file_path.name,
+            "file_path": str(file_path),
+            "file_size": file_stats.st_size,
+            "file_extension": file_extension,
+            "created_at": file_stats.st_ctime,
+            "modified_at": file_stats.st_mtime,
+            "is_supported": file_extension in self.supported_formats
+        }
+
+        # Try to get basic metadata without full processing
+        if file_extension == '.pdf':
+            try:
+                with open(file_path, 'rb') as pdf_file:
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    info["pages"] = len(pdf_reader.pages)
+                    pdf_metadata = pdf_reader.metadata
+                    if pdf_metadata:
+                        info["title"] = pdf_metadata.get('/Title', '')
+                        info["author"] = pdf_metadata.get('/Author', '')
+            except Exception:
+                info["pages"] = "unknown"
+        elif file_extension == '.docx':
+            try:
+                doc = DocxDocument(file_path)
+                info["pages"] = doc.core_properties.pages if doc.core_properties.pages else "unknown"
+                info["title"] = doc.core_properties.title or ""
+                info["author"] = doc.core_properties.author or ""
+            except Exception:
+                info["pages"] = "unknown"
+        elif file_extension == '.epub':
+            try:
+                book = epub.read_epub(file_path)
+                info["title"] = list(book.get_metadata('DC', 'title'))[0][0] if book.get_metadata('DC', 'title') else ""
+            except Exception:
+                info["title"] = "unknown"
+        elif file_extension == '.txt':
+            info["line_count"] = sum(1 for line in open(file_path, 'r', encoding='utf-8'))
+
+        return info
+
+
+class BatchDocumentProcessor:
+    """Class for processing multiple documents in batch."""
+
+    def __init__(self):
+        """Initialize the batch document processor."""
+        self.processor = DocumentProcessor()
+
+    async def process_documents(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """Process multiple documents asynchronously.
+
+        Args:
+            file_paths: List of paths to document files
+
+        Returns:
+            List of processed document results
+        """
+        tasks = [self.processor.process_document(file_path) for file_path in file_paths]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Error processing {file_paths[i]}: {str(result)}")
+                processed_results.append({
+                    "file_path": file_paths[i],
+                    "error": str(result),
+                    "success": False
+                })
+            else:
+                result["success"] = True
+                processed_results.append(result)
+
+        return processed_results
 
 
 # Global instance of the document processor
 document_processor = DocumentProcessor()
+batch_document_processor = BatchDocumentProcessor()
